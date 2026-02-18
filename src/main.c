@@ -1,7 +1,7 @@
 // rmt - Remote Mount Tool
 // Sync remote directories locally to use with goto, vic, peek, ff
 #define _POSIX_C_SOURCE 200809L
-#define _DARWIN_C_SOURCE 
+#define _DARWIN_C_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -391,15 +391,14 @@ static int rsync_push(const char *local, const char *remote, int dry_run) {
 }
 
 static int rsync_bidirectional(const char *local, const char *remote, int dry_run) {
-    printf("Pulling changes from remote...\n");
-    if (rsync_pull(remote, local, dry_run) != 0) {
-        fprintf(stderr, "Pull failed\n");
-        return -1;
-    }
-
     printf("\nPushing local changes to remote...\n");
     if (rsync_push(local, remote, dry_run) != 0) {
         fprintf(stderr, "Push failed\n");
+        return -1;
+    }
+    printf("Pulling changes from remote...\n");
+    if (rsync_pull(remote, local, dry_run) != 0) {
+        fprintf(stderr, "Pull failed\n");
         return -1;
     }
 
