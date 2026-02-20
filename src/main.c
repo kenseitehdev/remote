@@ -50,7 +50,7 @@ static void shell_quote(char *out, size_t out_len, const char *in) {
     size_t j = 0;
     if (out_len < 3) { if (out_len > 0) out[0] = '\0'; return; }
     out[j++] = '\'';
-    for (size_t i = 0; in[i] != '\0' && j + 5 < out_len; i++) {
+    for (size_t i = 0; in[i] != '\0' && j + 6 < out_len; i++) {
         if (in[i] == '\'') {
             const char *esc = "'\"'\"'";
             for (int k = 0; esc[k] && j + 1 < out_len; k++) out[j++] = esc[k];
@@ -61,7 +61,6 @@ static void shell_quote(char *out, size_t out_len, const char *in) {
     if (j + 1 < out_len) out[j++] = '\'';
     out[j] = '\0';
 }
-
 static int mkdir_p(const char *path) {
     char tmp[MAX_PATH_LEN];
     snprintf(tmp, sizeof(tmp), "%s", path);
