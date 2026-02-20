@@ -16,7 +16,7 @@
 #include <sys/file.h>
 #include <dirent.h>
 #include <stdlib.h>
-
+#include <ctype.h>
 #define MAX_MOUNTS   32
 #define MAX_PATH_LEN 4096
 #define VERSION      "1.1.0"
@@ -46,6 +46,50 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
+static const char *find_rsync_path(void) {
+    // Prefer PATH rsync; fallback to common locations.
+    static char path[PATH_MAX];
+
+    FILE *fp = popen("command -v rsync 2>/dev/null", "r");
+    if (fp) {
+        if (fgets(path, sizeof(path), fp)) {
+            path[strcspn(path, "\n")] = '\0';
+            pclose(fp);
+            if (path[0]) return path;
+        }
+        pclose(fp);
+    }
+
+    // Fallbacks
+    if (access("/opt/homebrew/bin/rsync", X_OK) == 0) return "/opt/homebrew/bin/rsync";
+    if (access("/usr/local/bin/rsync", X_OK) == 0)    return "/usr/local/bin/rsync";
+    if (access("/usr/bin/rsync", X_OK) == 0)          return "/usr/bin/rsync";
+    return "rsync";
+}
+
+static int rsync_version_major(const char *rsync_path) {
+    if (!rsync_path) rsync_path = "rsync";
+
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof(cmd), "%s --version 2>/dev/null", rsync_path);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return 0;
+
+    char line[256];
+    int major = 0;
+
+    if (fgets(line, sizeof(line), fp)) {
+        char *p = strstr(line, "version");
+        if (p) {
+            p += (int)strlen("version");
+            while (*p && isspace((unsigned char)*p)) p++;
+            major = atoi(p);
+        }
+    }
+    pclose(fp);
+    return major;
+}
 
 static char *shell_quote(const char *in) {
     size_t len = strlen(in);
@@ -66,6 +110,52 @@ static char *shell_quote(const char *in) {
     return out;
 }
 
+
+// Escape only the remote PATH portion after ':' so old rsync + remote shell wonât split.
+static char *rsync_escape_remote_spec_legacy(const char *remote_spec) {
+    if (!remote_spec) return NULL;
+
+    const char *colon = strchr(remote_spec, ':');
+    if (!colon) return strdup(remote_spec);
+
+    size_t host_len = (size_t)(colon - remote_spec);
+    const char *rpath = colon + 1;
+    size_t rlen = strlen(rpath);
+
+    size_t cap = host_len + 1 + (rlen * 2) + 1;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+
+    memcpy(out, remote_spec, host_len);
+    out[host_len] = ':';
+
+    size_t j = host_len + 1;
+    for (size_t i = 0; i < rlen; i++) {
+        unsigned char c = (unsigned char)rpath[i];
+        switch (c) {
+            case ' ': case '\t': case '\n':
+            case '\\':
+            case '\'': case '"':
+            case '$': case '`': case '!':
+            case '(': case ')':
+            case '{': case '}':
+            case '[': case ']':
+            case '*': case '?':
+            case '&': case ';':
+            case '<': case '>':
+            case '|':
+                out[j++] = '\\';
+                out[j++] = (char)c;
+                break;
+            default:
+                out[j++] = (char)c;
+                break;
+        }
+        if (j + 2 >= cap) break;
+    }
+    out[j] = '\0';
+    return out;
+}
 static int mkdir_p(const char *path) {
     char tmp[MAX_PATH_LEN];
     snprintf(tmp, sizeof(tmp), "%s", path);
@@ -367,59 +457,86 @@ static int cmd_unmount(const char *local, int keep_local) {
 
     return 0;
 }
-
-// ---------------------------------------------------------------------------
-// Rsync helpers
-// ---------------------------------------------------------------------------
-
 static int rsync_pull(const char *remote, const char *local, int dry_run) {
-    char *qremote = shell_quote(remote);
+    // Always use legacy-safe escaping for remote path portion
+    char *remote_arg = rsync_escape_remote_spec_legacy(remote);
+    if (!remote_arg) return -1;
+
+    char *qremote = shell_quote(remote_arg);
     char *qlocal  = shell_quote(local);
+    free(remote_arg);
+
     if (!qremote || !qlocal) { free(qremote); free(qlocal); return -1; }
+
     char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "rsync -avz%s --exclude=%s/ %s/ %s/ 2>&1",
-             dry_run ? "n" : "", BASE_DIR_NAME, qremote, qlocal);
+    snprintf(cmd, sizeof(cmd),
+        "rsync -avz%s --exclude=%s/ %s/ %s/ 2>&1",
+        dry_run ? "n" : "", BASE_DIR_NAME, qremote, qlocal);
+
     free(qremote);
     free(qlocal);
+
     if (dry_run) printf("Dry run (pull): %s -> %s\n", remote, local);
+
     int rc = system(cmd);
     return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
 }
-
 static int rsync_push(const char *local, const char *remote, int dry_run) {
+    char *remote_arg = rsync_escape_remote_spec_legacy(remote);
+    if (!remote_arg) return -1;
+
     char *qlocal  = shell_quote(local);
-    char *qremote = shell_quote(remote);
+    char *qremote = shell_quote(remote_arg);
+    free(remote_arg);
+
     if (!qlocal || !qremote) { free(qlocal); free(qremote); return -1; }
+
     char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "rsync -avz%s --exclude=%s/ %s/ %s/ 2>&1",
-             dry_run ? "n" : "", BASE_DIR_NAME, qlocal, qremote);
+    snprintf(cmd, sizeof(cmd),
+        "rsync -avz%s --exclude=%s/ %s/ %s/ 2>&1",
+        dry_run ? "n" : "", BASE_DIR_NAME, qlocal, qremote);
+
     free(qlocal);
     free(qremote);
+
     if (dry_run) printf("Dry run (push): %s -> %s\n", local, remote);
+
     int rc = system(cmd);
     return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
 }
-
 static int rsync_push_file(const char *src_path, const char *remote_spec,
-                            const char *rel) {
+                           const char *rel) {
+    // Build remote destination "user@host:/base/rel"
     char remote_file[MAX_PATH_LEN * 2];
     snprintf(remote_file, sizeof(remote_file), "%s/%s", remote_spec, rel);
 
-    char *qsrc = shell_quote(src_path);
-    char *qrf  = shell_quote(remote_file);
-    if (!qsrc || !qrf) { free(qsrc); free(qrf); return -1; }
+    // Always legacy-escape remote path portion after ':'
+    char *remote_arg = rsync_escape_remote_spec_legacy(remote_file);
+    if (!remote_arg) return -1;
 
-    /* Ensure remote directory exists */
+    char *qsrc = shell_quote(src_path);
+    char *qdst = shell_quote(remote_arg);
+    free(remote_arg);
+
+    if (!qsrc || !qdst) { free(qsrc); free(qdst); return -1; }
+
+    /* Ensure remote directory exists via ssh mkdir -p */
     char rel_dir[MAX_PATH_LEN];
     strncpy(rel_dir, rel, sizeof(rel_dir) - 1);
+    rel_dir[sizeof(rel_dir) - 1] = '\0';
+
     char *rd = dirname(rel_dir);
     if (strcmp(rd, ".") != 0) {
         char ssh_host[MAX_PATH_LEN], remote_path[MAX_PATH_LEN];
         const char *colon = strchr(remote_spec, ':');
         if (colon) {
-            size_t hlen = colon - remote_spec;
-            strncpy(ssh_host, remote_spec, hlen); ssh_host[hlen] = '\0';
+            size_t hlen = (size_t)(colon - remote_spec);
+            if (hlen >= sizeof(ssh_host)) hlen = sizeof(ssh_host) - 1;
+            strncpy(ssh_host, remote_spec, hlen);
+            ssh_host[hlen] = '\0';
+
             snprintf(remote_path, sizeof(remote_path), "%s/%s", colon + 1, rd);
+
             char *qhost  = shell_quote(ssh_host);
             char *qrpath = shell_quote(remote_path);
             if (qhost && qrpath) {
@@ -434,17 +551,15 @@ static int rsync_push_file(const char *src_path, const char *remote_spec,
     }
 
     char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "rsync -az %s %s 2>&1", qsrc, qrf);
+    snprintf(cmd, sizeof(cmd),
+        "rsync -az %s %s 2>&1", qsrc, qdst);
+
     free(qsrc);
-    free(qrf);
+    free(qdst);
+
     int rc = system(cmd);
     return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
 }
-
-// ---------------------------------------------------------------------------
-// Directory walk
-// ---------------------------------------------------------------------------
-
 typedef struct { char **paths; int count; int cap; } PathList;
 
 static void pl_push(PathList *pl, const char *rel) {
