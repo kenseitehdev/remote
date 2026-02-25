@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
@@ -17,6 +18,7 @@
 #include <dirent.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <pthread.h>
 #define MAX_MOUNTS   32
 #define MAX_PATH_LEN 4096
 #define VERSION      "1.1.0"
@@ -44,10 +46,60 @@ static void usage(const char *prog);
 static int smart_sync(const char *local_root, const char *remote_spec, int dry_run);
 
 // ---------------------------------------------------------------------------
+// Progress: spinner (for black-box ops) + fill bar (for file loop)
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const char *label;
+    volatile int done;
+} SpinnerArgs;
+
+static void *spinner_thread(void *arg) {
+    SpinnerArgs *s = (SpinnerArgs *)arg;
+    const char *frames[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
+    int nf = 10, f = 0;
+    struct timespec ts = {0, 80000000};
+    while (!s->done) {
+        fprintf(stderr, "\r  %s %s  ", frames[f++ % nf], s->label);
+        fflush(stderr);
+        nanosleep(&ts, NULL);
+    }
+    // Clear the spinner line so subsequent output is clean
+    fprintf(stderr, "\r  \033[2K");
+    fflush(stderr);
+    return NULL;
+}
+
+// Run cmd via system() while showing an animated spinner on stderr.
+// Returns the exit code of the command.
+static int system_with_spinner(const char *cmd, const char *label) {
+    SpinnerArgs args = { label, 0 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, spinner_thread, &args);
+    int rc = system(cmd);
+    args.done = 1;
+    pthread_join(tid, NULL);
+    return rc;
+}
+
+// Draw an in-place fill bar on stderr.
+// Call with current == total to finalise (prints newline).
+#define BAR_WIDTH 35
+static void draw_bar(int current, int total, const char *label) {
+    int filled = (total > 0) ? (current * BAR_WIDTH) / total : BAR_WIDTH;
+    int pct    = (total > 0) ? (current * 100) / total : 100;
+    fprintf(stderr, "\r  %-18s [", label);
+    for (int i = 0; i < BAR_WIDTH; i++)
+        fputc(i < filled ? '#' : '-', stderr);
+    fprintf(stderr, "] %3d%%  ", pct);
+    fflush(stderr);
+    if (current >= total) fprintf(stderr, "\n");
+}
+
+// ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
 static const char *find_rsync_path(void) {
-    // Prefer PATH rsync; fallback to common locations.
     static char path[PATH_MAX];
 
     FILE *fp = popen("command -v rsync 2>/dev/null", "r");
@@ -60,7 +112,6 @@ static const char *find_rsync_path(void) {
         pclose(fp);
     }
 
-    // Fallbacks
     if (access("/opt/homebrew/bin/rsync", X_OK) == 0) return "/opt/homebrew/bin/rsync";
     if (access("/usr/local/bin/rsync", X_OK) == 0)    return "/usr/local/bin/rsync";
     if (access("/usr/bin/rsync", X_OK) == 0)          return "/usr/bin/rsync";
@@ -110,8 +161,6 @@ static char *shell_quote(const char *in) {
     return out;
 }
 
-
-// Escape only the remote PATH portion after ':' so old rsync + remote shell won�t split.
 static char *rsync_escape_remote_spec_legacy(const char *remote_spec) {
     if (!remote_spec) return NULL;
 
@@ -156,6 +205,7 @@ static char *rsync_escape_remote_spec_legacy(const char *remote_spec) {
     out[j] = '\0';
     return out;
 }
+
 static int mkdir_p(const char *path) {
     char tmp[MAX_PATH_LEN];
     snprintf(tmp, sizeof(tmp), "%s", path);
@@ -244,10 +294,10 @@ static int base_update(const char *local_root, const char *rel,
     if (fd < 0) { perror("mkstemp"); return -1; }
 
     FILE *in  = fopen(src_path, "rb");
-    FILE *out = fdopen(fd, "wb");
-    if (!in || !out) {
-        if (in)  fclose(in);
-        if (out) fclose(out); else close(fd);
+    FILE *out_f = fdopen(fd, "wb");
+    if (!in || !out_f) {
+        if (in)    fclose(in);
+        if (out_f) fclose(out_f); else close(fd);
         unlink(tmp);
         return -1;
     }
@@ -256,10 +306,10 @@ static int base_update(const char *local_root, const char *rel,
     size_t nr;
     int rc = 0;
     while ((nr = fread(buf, 1, sizeof(buf), in)) > 0)
-        if (fwrite(buf, 1, nr, out) != nr) { rc = -1; break; }
+        if (fwrite(buf, 1, nr, out_f) != nr) { rc = -1; break; }
 
     fclose(in);
-    fclose(out);
+    fclose(out_f);
 
     if (rc == 0 && rename(tmp, base) != 0) { perror("rename"); unlink(tmp); rc = -1; }
     else if (rc != 0) unlink(tmp);
@@ -288,9 +338,10 @@ static int base_init(const char *local_root)
     snprintf(cmd, sizeof(cmd),
              "rsync -a --exclude=%s/ %s/ %s/ 2>/dev/null",
              BASE_DIR_NAME, qlocal, qbase);
-    int rc = system(cmd);
     free(qlocal);
     free(qbase);
+
+    int rc = system_with_spinner(cmd, "Building base cache");
     return rc == 0 ? 0 : -1;
 }
 
@@ -390,7 +441,6 @@ static Mount *find_mount(MountRegistry *reg, const char *local) {
     return NULL;
 }
 
-// Takes an already-resolved absolute path — no second realpath call
 static int remove_mount_by_resolved(MountRegistry *reg, const char *resolved) {
     for (int i = 0; i < reg->count; i++) {
         if (strcmp(reg->mounts[i].local_path, resolved) == 0) {
@@ -409,7 +459,6 @@ static int cmd_unmount(const char *local, int keep_local) {
     Mount *m = find_mount(&reg, local);
     if (!m) { fprintf(stderr, "%s is not a mounted path\n", local); return 1; }
 
-    // Capture the resolved path now, before anything touches the filesystem
     char resolved[MAX_PATH_LEN];
     strncpy(resolved, m->local_path, sizeof(resolved) - 1);
     resolved[sizeof(resolved) - 1] = '\0';
@@ -432,7 +481,6 @@ static int cmd_unmount(const char *local, int keep_local) {
         }
     }
 
-    // Use pre-resolved path — no second realpath, no race
     if (remove_mount_by_resolved(&reg, resolved) != 0) {
         fprintf(stderr, "Failed to remove from registry\n");
         return 1;
@@ -457,8 +505,12 @@ static int cmd_unmount(const char *local, int keep_local) {
 
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// rsync wrappers — spinner for all blocking rsync calls
+// ---------------------------------------------------------------------------
+
 static int rsync_pull(const char *remote, const char *local, int dry_run) {
-    // Always use legacy-safe escaping for remote path portion
     char *remote_arg = rsync_escape_remote_spec_legacy(remote);
     if (!remote_arg) return -1;
 
@@ -470,17 +522,22 @@ static int rsync_pull(const char *remote, const char *local, int dry_run) {
 
     char cmd[8192];
     snprintf(cmd, sizeof(cmd),
-        "rsync -avz%s --exclude=%s/ %s/ %s/ 2>&1",
+        "rsync -az%s --exclude=%s/ %s/ %s/ 2>/dev/null",
         dry_run ? "n" : "", BASE_DIR_NAME, qremote, qlocal);
 
     free(qremote);
     free(qlocal);
 
-    if (dry_run) printf("Dry run (pull): %s -> %s\n", remote, local);
+    if (dry_run) {
+        printf("Dry run (pull): %s -> %s\n", remote, local);
+        int rc = system(cmd);
+        return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+    }
 
-    int rc = system(cmd);
+    int rc = system_with_spinner(cmd, "Pulling from remote");
     return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
 }
+
 static int rsync_push(const char *local, const char *remote, int dry_run) {
     char *remote_arg = rsync_escape_remote_spec_legacy(remote);
     if (!remote_arg) return -1;
@@ -493,24 +550,27 @@ static int rsync_push(const char *local, const char *remote, int dry_run) {
 
     char cmd[8192];
     snprintf(cmd, sizeof(cmd),
-        "rsync -avz%s --exclude=%s/ %s/ %s/ 2>&1",
+        "rsync -az%s --exclude=%s/ %s/ %s/ 2>/dev/null",
         dry_run ? "n" : "", BASE_DIR_NAME, qlocal, qremote);
 
     free(qlocal);
     free(qremote);
 
-    if (dry_run) printf("Dry run (push): %s -> %s\n", local, remote);
+    if (dry_run) {
+        printf("Dry run (push): %s -> %s\n", local, remote);
+        int rc = system(cmd);
+        return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+    }
 
-    int rc = system(cmd);
+    int rc = system_with_spinner(cmd, "Pushing to remote");
     return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
 }
+
 static int rsync_push_file(const char *src_path, const char *remote_spec,
                            const char *rel) {
-    // Build remote destination "user@host:/base/rel"
     char remote_file[MAX_PATH_LEN * 2];
     snprintf(remote_file, sizeof(remote_file), "%s/%s", remote_spec, rel);
 
-    // Always legacy-escape remote path portion after ':'
     char *remote_arg = rsync_escape_remote_spec_legacy(remote_file);
     if (!remote_arg) return -1;
 
@@ -520,7 +580,6 @@ static int rsync_push_file(const char *src_path, const char *remote_spec,
 
     if (!qsrc || !qdst) { free(qsrc); free(qdst); return -1; }
 
-    /* Ensure remote directory exists via ssh mkdir -p */
     char rel_dir[MAX_PATH_LEN];
     strncpy(rel_dir, rel, sizeof(rel_dir) - 1);
     rel_dir[sizeof(rel_dir) - 1] = '\0';
@@ -551,15 +610,16 @@ static int rsync_push_file(const char *src_path, const char *remote_spec,
     }
 
     char cmd[8192];
-    snprintf(cmd, sizeof(cmd),
-        "rsync -az %s %s 2>&1", qsrc, qdst);
+    snprintf(cmd, sizeof(cmd), "rsync -az %s %s 2>/dev/null", qsrc, qdst);
 
     free(qsrc);
     free(qdst);
 
+    // per-file push: no spinner (called inside the file loop which has its own bar)
     int rc = system(cmd);
     return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
 }
+
 typedef struct { char **paths; int count; int cap; } PathList;
 
 static void pl_push(PathList *pl, const char *rel) {
@@ -676,7 +736,7 @@ static void print_conflict(const char *local_file) {
     printf("║    =======                                               ║\n");
     printf("║    >>>>>>> theirs                                        ║\n");
     printf("║                                                          ║\n");
-    printf("║  Resolve the conflict, then run:                         ║\n");
+    printf("║  Resolve the conflict, then run:                        ║\n");
     printf("║    rmt sync <path> --push                                ║\n");
     printf("╚══════════════════════════════════════════════════════════╝\n");
     printf("\n");
@@ -687,7 +747,8 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
     snprintf(tmp_remote, sizeof(tmp_remote), "/tmp/rmt_remote_XXXXXX");
     if (!mkdtemp(tmp_remote)) { perror("mkdtemp"); return -1; }
 
-    printf("Fetching remote tree for comparison...\n");
+    // Fetch remote tree — spinner covers this blocking rsync
+    printf("Fetching remote tree...\n");
     if (rsync_pull(remote_spec, tmp_remote, 0) != 0) {
         fprintf(stderr, "Failed to fetch remote tree\n");
         char *qtmp = shell_quote(tmp_remote);
@@ -710,7 +771,7 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
     qsort(remote_only->paths, remote_only->count, sizeof(char *), pl_cmp);
 
     int total = files->count + remote_only->count;
-    char **all = malloc(total * sizeof(char *));
+    char **all = malloc((total ? total : 1) * sizeof(char *));
     int n = 0;
     for (int i = 0; i < files->count;       i++) all[n++] = files->paths[i];
     for (int i = 0; i < remote_only->count; i++) all[n++] = remote_only->paths[i];
@@ -719,11 +780,30 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
     int pushed = 0, pulled = 0, merged = 0, skipped = 0;
     int result = 0;
 
+    // Count unique files for the progress bar
+    int unique = 0;
+    {
+        const char *p = NULL;
+        for (int i = 0; i < n; i++) {
+            if (!p || strcmp(all[i], p) != 0) { unique++; p = all[i]; }
+        }
+    }
+
+    // Action log lines print below the bar — we'll keep bar on stderr, log on stdout
+    if (unique > 0) {
+        printf("Comparing %d file%s...\n", unique, unique == 1 ? "" : "s");
+        draw_bar(0, unique, "Analysing");
+    }
+
+    int done = 0;
     const char *prev = NULL;
     for (int i = 0; i < n && result == 0; i++) {
         const char *rel = all[i];
         if (prev && strcmp(rel, prev) == 0) continue;
         prev = rel;
+
+        // Update bar before processing each file
+        draw_bar(done, unique, "Analysing");
 
         char local_file[MAX_PATH_LEN], base_file[MAX_PATH_LEN], remote_file[MAX_PATH_LEN];
         snprintf(local_file,  sizeof(local_file),  "%s/%s", local_root, rel);
@@ -734,10 +814,13 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
         int has_remote = (access(remote_file, F_OK) == 0);
         int has_base   = (access(base_file,   F_OK) == 0);
 
+        done++;
+
         if (!has_local && !has_remote) continue;
 
         /* New file only on remote */
         if (!has_local && has_remote && !has_base) {
+            fprintf(stderr, "\r\033[2K");  // clear bar line before printing action
             printf("  pull (new)    %s\n", rel);
             if (!dry_run) {
                 char lf_copy[MAX_PATH_LEN];
@@ -761,6 +844,7 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
         if (!has_local && has_base) {
             int remote_changed = has_remote ? (run_comp_diff(base_file, remote_file) == 1) : 0;
             if (remote_changed) {
+                fprintf(stderr, "\r\033[2K");
                 printf("  conflict      %s (deleted locally, modified remotely — keeping remote)\n", rel);
                 if (!dry_run) {
                     char lf_copy[MAX_PATH_LEN];
@@ -777,6 +861,7 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
                     base_update(local_root, rel, local_file);
                 }
             } else {
+                fprintf(stderr, "\r\033[2K");
                 printf("  delete remote %s\n", rel);
                 if (!dry_run) {
                     char ssh_host[MAX_PATH_LEN], remote_path[MAX_PATH_LEN];
@@ -803,6 +888,7 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
 
         /* File only local (new) */
         if (has_local && !has_remote && !has_base) {
+            fprintf(stderr, "\r\033[2K");
             printf("  push (new)    %s\n", rel);
             if (!dry_run) {
                 rsync_push_file(local_file, remote_spec, rel);
@@ -822,6 +908,7 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
         }
 
         if (local_changed && !remote_changed) {
+            fprintf(stderr, "\r\033[2K");
             printf("  push          %s\n", rel);
             if (!dry_run) {
                 rsync_push_file(local_file, remote_spec, rel);
@@ -832,6 +919,7 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
         }
 
         if (!local_changed && remote_changed) {
+            fprintf(stderr, "\r\033[2K");
             printf("  pull          %s\n", rel);
             if (!dry_run) {
                 char lf_copy[MAX_PATH_LEN];
@@ -852,6 +940,7 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
         }
 
         /* Both changed — 3-way merge */
+        fprintf(stderr, "\r\033[2K");
         printf("  merge         %s\n", rel);
         if (!dry_run) {
             char merged_file[MAX_PATH_LEN];
@@ -882,11 +971,13 @@ static int smart_sync(const char *local_root, const char *remote_spec, int dry_r
         }
     }
 
+    // Finalise bar
+    if (unique > 0) draw_bar(unique, unique, "Analysing");
+
     free(all);
     pl_free(files);
     pl_free(remote_only);
 
-    /* Cleanup temp remote dir */
     char *qtmp = shell_quote(tmp_remote);
     if (qtmp) {
         char cmd[MAX_PATH_LEN * 2 + 16];
@@ -941,20 +1032,26 @@ static int cmd_mount(const char *remote, const char *local) {
         return 1;
     }
 
-    printf("Mounting %s at %s...\n", remote, resolved_local);
-    printf("Initial sync (this may take a while)...\n\n");
+    printf("Mounting %s → %s\n\n", remote, resolved_local);
 
+    // [1/3] Initial pull — spinner shown inside rsync_pull
+    printf("[1/3] Pulling remote files...\n");
     if (rsync_pull(remote, resolved_local, 0) != 0) {
         fprintf(stderr, "\nMount failed: rsync error\n");
         return 1;
     }
+    printf("      Done.\n\n");
 
-    printf("Initialising base cache...\n");
+    // [2/3] Base cache — spinner shown inside base_init
+    printf("[2/3] Building base cache...\n");
     if (base_init(resolved_local) != 0) {
         fprintf(stderr, "Warning: failed to initialise base cache\n");
         fprintf(stderr, "First sync will treat all files as locally changed\n");
     }
+    printf("      Done.\n\n");
 
+    // [3/3] Register
+    printf("[3/3] Registering mount...\n");
     Mount *m = &reg.mounts[reg.count++];
     strncpy(m->local_path,   resolved_local, MAX_PATH_LEN - 1);
     strncpy(m->remote_spec,  remote,         MAX_PATH_LEN - 1);
@@ -963,8 +1060,9 @@ static int cmd_mount(const char *remote, const char *local) {
 
     if (save_registry(&reg) != 0)
         fprintf(stderr, "Warning: Failed to save registry\n");
+    printf("      Done.\n\n");
 
-    printf("\n✓ Mounted successfully\n");
+    printf("✓ Mounted successfully\n");
     printf("  Local:  %s\n", resolved_local);
     printf("  Remote: %s\n", remote);
     printf("\nSync changes with: rmt sync %s\n", resolved_local);

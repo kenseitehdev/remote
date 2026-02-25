@@ -1,1 +1,0 @@
-1. rsync not working with single quote filenames and dir names
